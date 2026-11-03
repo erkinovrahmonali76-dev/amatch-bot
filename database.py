@@ -1,6 +1,7 @@
 
 import sqlite3
 from datetime import datetime, timedelta, timezone
+
 from config import DB_PATH
 
 
@@ -9,13 +10,16 @@ def now():
 
 
 def conn():
-    c = sqlite3.connect(DB_PATH)
+    c = sqlite3.connect(DB_PATH, timeout=30)
     c.row_factory = sqlite3.Row
+    c.execute("PRAGMA foreign_keys = ON")
     return c
 
 
 def init_db():
     with conn() as c:
+        c.execute("PRAGMA journal_mode = WAL")
+
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users(
             user_id INTEGER PRIMARY KEY,
@@ -33,15 +37,15 @@ def init_db():
         );
 
         CREATE TABLE IF NOT EXISTS likes(
-            from_id INTEGER,
-            to_id INTEGER,
+            from_id INTEGER NOT NULL,
+            to_id INTEGER NOT NULL,
             created_at TEXT,
             PRIMARY KEY(from_id, to_id)
         );
 
         CREATE TABLE IF NOT EXISTS skips(
-            from_id INTEGER,
-            to_id INTEGER,
+            from_id INTEGER NOT NULL,
+            to_id INTEGER NOT NULL,
             created_at TEXT,
             PRIMARY KEY(from_id, to_id)
         );
@@ -98,66 +102,93 @@ def init_db():
 
         columns = {
             row["name"]
-            for row in c.execute("PRAGMA table_info(users)").fetchall()
+            for row in c.execute(
+                "PRAGMA table_info(users)"
+            ).fetchall()
         }
 
         if "adult_verified" not in columns:
-            c.execute(
-                "ALTER TABLE users ADD COLUMN adult_verified INTEGER DEFAULT 0"
-            )
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN adult_verified INTEGER DEFAULT 0
+            """)
 
         if "is_active" not in columns:
-            c.execute(
-                "ALTER TABLE users ADD COLUMN is_active INTEGER DEFAULT 1"
-            )
+            c.execute("""
+                ALTER TABLE users
+                ADD COLUMN is_active INTEGER DEFAULT 1
+            """)
+
+        c.executescript("""
+        CREATE INDEX IF NOT EXISTS idx_users_search
+        ON users(approved, is_active, age);
+
+        CREATE INDEX IF NOT EXISTS idx_likes_to
+        ON likes(to_id);
+
+        CREATE INDEX IF NOT EXISTS idx_skips_from
+        ON skips(from_id);
+
+        CREATE INDEX IF NOT EXISTS idx_payments_status
+        ON payments(status);
+        """)
 
 
 def save_user(user_id, **kw):
-    fields = [
+    allowed = {
         "age", "city", "name", "gender", "bio",
         "photo_id", "username", "approved", "created_at"
-    ]
+    }
+
+    updates = {
+        key: value
+        for key, value in kw.items()
+        if key in allowed and value is not None
+    }
 
     with conn() as c:
         existing = c.execute(
-            "SELECT * FROM users WHERE user_id=?", (user_id,)
+            "SELECT user_id FROM users WHERE user_id=?",
+            (user_id,)
         ).fetchone()
 
         if existing:
-            updates = {
-                key: value
-                for key, value in kw.items()
-                if key in fields and value is not None
-            }
-
             if updates:
-                sql = ", ".join(f"{key}=?" for key in updates)
+                sql = ", ".join(
+                    f"{key}=?" for key in updates
+                )
                 c.execute(
                     f"UPDATE users SET {sql} WHERE user_id=?",
                     list(updates.values()) + [user_id]
                 )
         else:
-            values = [kw.get(key) for key in fields]
-            c.execute("""
-                INSERT INTO users(
-                    user_id, age, city, name, gender, bio,
-                    photo_id, username, approved, created_at
-                ) VALUES(?,?,?,?,?,?,?,?,?,?)
-            """, [user_id] + values)
+            fields = ["user_id"] + list(updates.keys())
+            values = [user_id] + list(updates.values())
+
+            placeholders = ",".join("?" for _ in fields)
+            c.execute(
+                f"""
+                INSERT INTO users ({",".join(fields)})
+                VALUES ({placeholders})
+                """,
+                values
+            )
 
 
 def get_user(uid):
     with conn() as c:
         return c.execute(
-            "SELECT * FROM users WHERE user_id=?", (uid,)
+            "SELECT * FROM users WHERE user_id=?",
+            (uid,)
         ).fetchone()
 
 
 def count_users():
     with conn() as c:
         return c.execute("""
-            SELECT COUNT(*) FROM users
-            WHERE approved=1 AND adult_verified=1 AND is_active=1
+            SELECT COUNT(*)
+            FROM users
+            WHERE approved=1 AND is_active=1
         """).fetchone()[0]
 
 
@@ -172,18 +203,42 @@ def is_premium(uid):
         return False
 
     try:
-        return (
-            datetime.fromisoformat(row["expires_at"])
-            > datetime.now(timezone.utc)
-        )
-    except Exception:
+        expiry = datetime.fromisoformat(row["expires_at"])
+        if expiry.tzinfo is None:
+            expiry = expiry.replace(tzinfo=timezone.utc)
+        return expiry > datetime.now(timezone.utc)
+    except (ValueError, TypeError):
         return False
 
 
 def activate_premium(uid, days):
-    until = datetime.now(timezone.utc) + timedelta(days=days)
+    if days not in (7, 30):
+        return False
+
+    current = datetime.now(timezone.utc)
 
     with conn() as c:
+        row = c.execute(
+            "SELECT expires_at FROM subscriptions WHERE user_id=?",
+            (uid,)
+        ).fetchone()
+
+        if row:
+            try:
+                old_expiry = datetime.fromisoformat(
+                    row["expires_at"]
+                )
+                if old_expiry.tzinfo is None:
+                    old_expiry = old_expiry.replace(
+                        tzinfo=timezone.utc
+                    )
+                if old_expiry > current:
+                    current = old_expiry
+            except (ValueError, TypeError):
+                pass
+
+        until = current + timedelta(days=days)
+
         c.execute("""
             INSERT INTO subscriptions(user_id, expires_at)
             VALUES(?,?)
@@ -191,13 +246,25 @@ def activate_premium(uid, days):
             DO UPDATE SET expires_at=excluded.expires_at
         """, (uid, until.isoformat()))
 
+    return True
+
 
 def create_payment(uid, days, amount, receipt_file_id):
+    if days not in (7, 30):
+        raise ValueError("Noto‘g‘ri tarif")
+
+    expected = {7: 25000, 30: 50000}
+
+    if amount != expected[days]:
+        raise ValueError("To‘lov summasi mos emas")
+
     with conn() as c:
         cur = c.execute("""
             INSERT INTO payments(
-                user_id, plan_days, amount, receipt_file_id, created_at
-            ) VALUES(?,?,?,?,?)
+                user_id, plan_days, amount,
+                receipt_file_id, created_at
+            )
+            VALUES(?,?,?,?,?)
         """, (uid, days, amount, receipt_file_id, now()))
 
         return cur.lastrowid
@@ -206,7 +273,8 @@ def create_payment(uid, days, amount, receipt_file_id):
 def get_payment(payment_id):
     with conn() as c:
         return c.execute(
-            "SELECT * FROM payments WHERE id=?", (payment_id,)
+            "SELECT * FROM payments WHERE id=?",
+            (payment_id,)
         ).fetchone()
 
 
@@ -235,74 +303,130 @@ def review_payment(payment_id, admin_id, approved):
             UPDATE payments
             SET status=?, reviewed_at=?, reviewed_by=?
             WHERE id=? AND status='pending'
-        """, (status, now(), admin_id, payment_id))
+        """, (
+            status, now(), admin_id, payment_id
+        ))
 
         if cur.rowcount != 1:
             return False
 
         if approved:
-            until = datetime.now(timezone.utc) + timedelta(
-                days=row["plan_days"]
-            )
+            uid = row["user_id"]
+            days = row["plan_days"]
+            current = datetime.now(timezone.utc)
+
+            old = c.execute(
+                "SELECT expires_at FROM subscriptions WHERE user_id=?",
+                (uid,)
+            ).fetchone()
+
+            if old:
+                try:
+                    expiry = datetime.fromisoformat(old["expires_at"])
+                    if expiry.tzinfo is None:
+                        expiry = expiry.replace(tzinfo=timezone.utc)
+                    if expiry > current:
+                        current = expiry
+                except (ValueError, TypeError):
+                    pass
+
+            until = current + timedelta(days=days)
 
             c.execute("""
                 INSERT INTO subscriptions(user_id, expires_at)
                 VALUES(?,?)
                 ON CONFLICT(user_id)
                 DO UPDATE SET expires_at=excluded.expires_at
-            """, (row["user_id"], until.isoformat()))
+            """, (uid, until.isoformat()))
 
         return True
 
 
-def next_profile(uid, gender):
-    if gender == "Erkak":
-        opposite_gender = "Ayol"
-    elif gender == "Ayol":
-        opposite_gender = "Erkak"
-    else:
+def _age_group(age):
+    if age is None:
         return None
+
+    if 15 <= age <= 17:
+        return (15, 17)
+
+    if 18 <= age <= 100:
+        return (18, 100)
+
+    return None
+
+
+def next_profile(uid, age=None):
+    user = get_user(uid)
+
+    if not user or not user["approved"] or not user["is_active"]:
+        return None
+
+    # Yosh faqat foydalanuvchi kiritgan ma'lumot.
+    # Bu mustaqil yosh tasdig'i hisoblanmaydi.
+    group = _age_group(user["age"])
+
+    if not group:
+        return None
+
+    min_age, max_age = group
 
     with conn() as c:
         return c.execute("""
             SELECT * FROM users
             WHERE approved=1
-              AND adult_verified=1
               AND is_active=1
+              AND age BETWEEN ? AND ?
               AND user_id != ?
-              AND gender = ?
               AND photo_id IS NOT NULL
+
               AND user_id NOT IN (
                   SELECT to_id FROM likes WHERE from_id=?
               )
+
               AND user_id NOT IN (
                   SELECT to_id FROM skips WHERE from_id=?
               )
+
               AND user_id NOT IN (
                   SELECT blocked_id FROM blocks WHERE user_id=?
               )
+
               AND user_id NOT IN (
                   SELECT user_id FROM blocks WHERE blocked_id=?
               )
+
             ORDER BY RANDOM()
             LIMIT 1
         """, (
-            uid, opposite_gender, uid, uid, uid, uid
+            min_age, max_age, uid,
+            uid, uid, uid, uid
         )).fetchone()
 
 
 def add_skip(a, b):
+    if a == b:
+        return False
+
     with conn() as c:
         c.execute("""
-            INSERT OR IGNORE INTO skips(from_id, to_id, created_at)
+            INSERT OR IGNORE INTO skips(
+                from_id, to_id, created_at
+            )
             VALUES(?,?,?)
         """, (a, b, now()))
 
+    return True
+
 
 def add_like(a, b):
+    if a == b:
+        return False
+
     with conn() as c:
         c.execute("""
-            INSERT OR IGNORE INTO likes(from_id, to_id, created_at)
+            INSERT OR IGNORE INTO likes(
+                from_id, to_id, created_at
+            )
             VALUES(?,?,?)
         """, (a, b, now()))
 
@@ -315,20 +439,25 @@ def add_like(a, b):
 def received_likes(uid):
     with conn() as c:
         return c.execute("""
-            SELECT u.* FROM likes l
+            SELECT u.*
+            FROM likes l
             JOIN users u ON u.user_id=l.from_id
             WHERE l.to_id=?
               AND u.approved=1
-              AND u.adult_verified=1
               AND u.is_active=1
             ORDER BY l.created_at DESC
         """, (uid,)).fetchall()
 
 
 def create_contact_request(a, b):
+    if a == b:
+        return None
+
     with conn() as c:
         cur = c.execute("""
-            INSERT INTO contact_requests(from_id, to_id, created_at)
+            INSERT INTO contact_requests(
+                from_id, to_id, created_at
+            )
             VALUES(?,?,?)
         """, (a, b, now()))
 
@@ -350,63 +479,59 @@ def get_request(rid):
 
 def set_request_status(rid, status):
     if status not in ("pending", "accepted", "rejected"):
-        return
-
-    with conn() as c:
-        c.execute(
-            "UPDATE contact_requests SET status=? WHERE id=?",
-            (status, rid)
-        )
-
-
-def create_chat_invite(a, b):
-    if a == b or not is_premium(a):
         return False
 
     with conn() as c:
-        used = c.execute("""
-            SELECT COUNT(*) FROM chat_invites
-            WHERE from_id=? AND status IN ('pending','accepted')
-        """, (a,)).fetchone()[0]
-
-        if used >= 5:
-            return False
-
-        try:
-            c.execute("""
-                INSERT INTO chat_invites(from_id, to_id, created_at)
-                VALUES(?,?,?)
-            """, (a, b, now()))
-            return True
-        except sqlite3.IntegrityError:
-            return False
-
-
-def review_chat_invite(invite_id, accepted):
-    status = "accepted" if accepted else "rejected"
-
-    with conn() as c:
         cur = c.execute("""
-            UPDATE chat_invites
+            UPDATE contact_requests
             SET status=?
             WHERE id=? AND status='pending'
-        """, (status, invite_id))
+        """, (status, rid))
 
         return cur.rowcount > 0
 
 
+def create_chat_invite(a, b):
+    # Bu funksiya hozircha o‘chirilgan.
+    # Voyaga yetmaganlar uchun nazoratsiz shaxsiy chat yo‘q.
+    return False
+
+
+def review_chat_invite(invite_id, accepted):
+    return False
+
+
 def block_user(uid, blocked_uid):
+    if uid == blocked_uid:
+        return False
+
     with conn() as c:
         c.execute("""
-            INSERT OR IGNORE INTO blocks(user_id, blocked_id, created_at)
+            INSERT OR IGNORE INTO blocks(
+                user_id, blocked_id, created_at
+            )
             VALUES(?,?,?)
         """, (uid, blocked_uid, now()))
 
+        # Bloklanganda avvalgi layklarni ham bekor qilamiz.
+        c.execute("""
+            DELETE FROM likes
+            WHERE (from_id=? AND to_id=?)
+               OR (from_id=? AND to_id=?)
+        """, (uid, blocked_uid, blocked_uid, uid))
+
+    return True
+
 
 def report_user(uid, reported_uid, reason=""):
+    if uid == reported_uid:
+        return None
+
     with conn() as c:
         cur = c.execute("""
-            INSERT INTO reports(from_id, to_id, reason, created_at)
+            INSERT INTO reports(
+                from_id, to_id, reason, created_at
+            )
             VALUES(?,?,?,?)
         """, (uid, reported_uid, reason[:300], now()))
 
