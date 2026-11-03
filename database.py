@@ -14,13 +14,6 @@ def conn():
     return c
 
 
-def table_columns(c, table):
-    return {
-        row["name"]
-        for row in c.execute(f"PRAGMA table_info({table})").fetchall()
-    }
-
-
 def init_db():
     with conn() as c:
         c.executescript("""
@@ -103,8 +96,10 @@ def init_db():
         );
         """)
 
-        # Eski bazaga yangi ustunlarni xavfsiz qo‘shish.
-        columns = table_columns(c, "users")
+        columns = {
+            row["name"]
+            for row in c.execute("PRAGMA table_info(users)").fetchall()
+        }
 
         if "adult_verified" not in columns:
             c.execute(
@@ -177,8 +172,10 @@ def is_premium(uid):
         return False
 
     try:
-        expiry = datetime.fromisoformat(row["expires_at"])
-        return expiry > datetime.now(timezone.utc)
+        return (
+            datetime.fromisoformat(row["expires_at"])
+            > datetime.now(timezone.utc)
+        )
     except Exception:
         return False
 
@@ -234,16 +231,20 @@ def review_payment(payment_id, admin_id, approved):
         if not row:
             return False
 
-        c.execute("""
+        cur = c.execute("""
             UPDATE payments
             SET status=?, reviewed_at=?, reviewed_by=?
             WHERE id=? AND status='pending'
         """, (status, now(), admin_id, payment_id))
 
+        if cur.rowcount != 1:
+            return False
+
         if approved:
             until = datetime.now(timezone.utc) + timedelta(
                 days=row["plan_days"]
             )
+
             c.execute("""
                 INSERT INTO subscriptions(user_id, expires_at)
                 VALUES(?,?)
@@ -255,6 +256,13 @@ def review_payment(payment_id, admin_id, approved):
 
 
 def next_profile(uid, gender):
+    if gender == "Erkak":
+        opposite_gender = "Ayol"
+    elif gender == "Ayol":
+        opposite_gender = "Erkak"
+    else:
+        return None
+
     with conn() as c:
         return c.execute("""
             SELECT * FROM users
@@ -262,7 +270,8 @@ def next_profile(uid, gender):
               AND adult_verified=1
               AND is_active=1
               AND user_id != ?
-              AND gender != ?
+              AND gender = ?
+              AND photo_id IS NOT NULL
               AND user_id NOT IN (
                   SELECT to_id FROM likes WHERE from_id=?
               )
@@ -277,7 +286,9 @@ def next_profile(uid, gender):
               )
             ORDER BY RANDOM()
             LIMIT 1
-        """, (uid, gender, uid, uid, uid, uid)).fetchone()
+        """, (
+            uid, opposite_gender, uid, uid, uid, uid
+        )).fetchone()
 
 
 def add_skip(a, b):
@@ -349,13 +360,10 @@ def set_request_status(rid, status):
 
 
 def create_chat_invite(a, b):
-    if a == b:
+    if a == b or not is_premium(a):
         return False
 
     with conn() as c:
-        if not is_premium(a):
-            return False
-
         used = c.execute("""
             SELECT COUNT(*) FROM chat_invites
             WHERE from_id=? AND status IN ('pending','accepted')
