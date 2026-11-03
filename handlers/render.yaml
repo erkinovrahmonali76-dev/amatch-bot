@@ -1,0 +1,17 @@
+services:
+  - type: worker
+    name: sara-match-bot
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: ADMIN_ID
+        sync: false
+      - key: DB_PATH
+        value: /var/data/sara_match.db
+    disk:
+      name: sara-match-data
+      mountPath: /var/data
+      sizeGB: 1
