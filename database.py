@@ -134,6 +134,8 @@ def init_db():
         """)
 
 
+# FOYDALANUVCHI SAQLASH
+
 def save_user(user_id, **kw):
     allowed = {
         "age", "city", "name", "gender", "bio",
@@ -166,6 +168,7 @@ def save_user(user_id, **kw):
             values = [user_id] + list(updates.values())
 
             placeholders = ",".join("?" for _ in fields)
+
             c.execute(
                 f"""
                 INSERT INTO users ({",".join(fields)})
@@ -183,14 +186,45 @@ def get_user(uid):
         ).fetchone()
 
 
+# STATISTIKA: BARCHA FOYDALANUVCHILAR
+
 def count_users():
     with conn() as c:
-        return c.execute("""
-            SELECT COUNT(*)
-            FROM users
-            WHERE approved=1 AND is_active=1
-        """).fetchone()[0]
+        return c.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
 
+
+def get_gender_stats():
+    with conn() as c:
+        total = c.execute(
+            "SELECT COUNT(*) FROM users"
+        ).fetchone()[0]
+
+        men = c.execute(
+            "SELECT COUNT(*) FROM users WHERE gender='Erkak'"
+        ).fetchone()[0]
+
+        women = c.execute(
+            "SELECT COUNT(*) FROM users WHERE gender='Ayol'"
+        ).fetchone()[0]
+
+        approved = c.execute(
+            "SELECT COUNT(*) FROM users WHERE approved=1"
+        ).fetchone()[0]
+
+        unapproved = total - approved
+
+        return {
+            "total": total,
+            "men": men,
+            "women": women,
+            "approved": approved,
+            "unapproved": unapproved
+        }
+
+
+# PREMIUM
 
 def is_premium(uid):
     with conn() as c:
@@ -204,9 +238,12 @@ def is_premium(uid):
 
     try:
         expiry = datetime.fromisoformat(row["expires_at"])
+
         if expiry.tzinfo is None:
             expiry = expiry.replace(tzinfo=timezone.utc)
+
         return expiry > datetime.now(timezone.utc)
+
     except (ValueError, TypeError):
         return False
 
@@ -225,15 +262,14 @@ def activate_premium(uid, days):
 
         if row:
             try:
-                old_expiry = datetime.fromisoformat(
-                    row["expires_at"]
-                )
-                if old_expiry.tzinfo is None:
-                    old_expiry = old_expiry.replace(
-                        tzinfo=timezone.utc
-                    )
-                if old_expiry > current:
-                    current = old_expiry
+                old = datetime.fromisoformat(row["expires_at"])
+
+                if old.tzinfo is None:
+                    old = old.replace(tzinfo=timezone.utc)
+
+                if old > current:
+                    current = old
+
             except (ValueError, TypeError):
                 pass
 
@@ -249,11 +285,16 @@ def activate_premium(uid, days):
     return True
 
 
+# TO‘LOVLAR
+
 def create_payment(uid, days, amount, receipt_file_id):
     if days not in (7, 30):
         raise ValueError("Noto‘g‘ri tarif")
 
-    expected = {7: 25000, 30: 50000}
+    expected = {
+        7: 25000,
+        30: 50000
+    }
 
     if amount != expected[days]:
         raise ValueError("To‘lov summasi mos emas")
@@ -265,7 +306,10 @@ def create_payment(uid, days, amount, receipt_file_id):
                 receipt_file_id, created_at
             )
             VALUES(?,?,?,?,?)
-        """, (uid, days, amount, receipt_file_id, now()))
+        """, (
+            uid, days, amount,
+            receipt_file_id, now()
+        ))
 
         return cur.lastrowid
 
@@ -322,11 +366,18 @@ def review_payment(payment_id, admin_id, approved):
 
             if old:
                 try:
-                    expiry = datetime.fromisoformat(old["expires_at"])
+                    expiry = datetime.fromisoformat(
+                        old["expires_at"]
+                    )
+
                     if expiry.tzinfo is None:
-                        expiry = expiry.replace(tzinfo=timezone.utc)
+                        expiry = expiry.replace(
+                            tzinfo=timezone.utc
+                        )
+
                     if expiry > current:
                         current = expiry
+
                 except (ValueError, TypeError):
                     pass
 
@@ -342,6 +393,8 @@ def review_payment(payment_id, admin_id, approved):
         return True
 
 
+# YOSH GURUHI
+
 def _age_group(age):
     if age is None:
         return None
@@ -355,14 +408,16 @@ def _age_group(age):
     return None
 
 
+# DO‘STLIK QIDIRUVI
+# Ommaviy foydalanishdan oldin moderatsiya va yosh xavfsizligi
+# tartiblarini yo‘lga qo‘yish zarur.
+
 def next_profile(uid, age=None):
     user = get_user(uid)
 
     if not user or not user["approved"] or not user["is_active"]:
         return None
 
-    # Yosh faqat foydalanuvchi kiritgan ma'lumot.
-    # Bu mustaqil yosh tasdig'i hisoblanmaydi.
     group = _age_group(user["age"])
 
     if not group:
@@ -403,6 +458,8 @@ def next_profile(uid, age=None):
         )).fetchone()
 
 
+# KEYINGI PROFIL
+
 def add_skip(a, b):
     if a == b:
         return False
@@ -417,6 +474,8 @@ def add_skip(a, b):
 
     return True
 
+
+# LAYK
 
 def add_like(a, b):
     if a == b:
@@ -449,6 +508,64 @@ def received_likes(uid):
         """, (uid,)).fetchall()
 
 
+# BLOKLASH
+
+def block_user(uid, blocked_uid):
+    if uid == blocked_uid:
+        return False
+
+    with conn() as c:
+        c.execute("""
+            INSERT OR IGNORE INTO blocks(
+                user_id, blocked_id, created_at
+            )
+            VALUES(?,?,?)
+        """, (uid, blocked_uid, now()))
+
+        c.execute("""
+            DELETE FROM likes
+            WHERE (from_id=? AND to_id=?)
+               OR (from_id=? AND to_id=?)
+        """, (
+            uid, blocked_uid,
+            blocked_uid, uid
+        ))
+
+    return True
+
+
+# SHIKOYAT
+
+def report_user(uid, reported_uid, reason=""):
+    if uid == reported_uid:
+        return None
+
+    with conn() as c:
+        cur = c.execute("""
+            INSERT INTO reports(
+                from_id, to_id, reason, created_at
+            )
+            VALUES(?,?,?,?)
+        """, (
+            uid, reported_uid,
+            reason[:300], now()
+        ))
+
+        return cur.lastrowid
+
+
+# SHAXSIY CHAT TAKLIFI HOZIRCHA O‘CHIRILGAN
+
+def create_chat_invite(a, b):
+    return False
+
+
+def review_chat_invite(invite_id, accepted):
+    return False
+
+
+# ALOQA SO‘ROVLARI
+
 def create_contact_request(a, b):
     if a == b:
         return None
@@ -478,7 +595,9 @@ def get_request(rid):
 
 
 def set_request_status(rid, status):
-    if status not in ("pending", "accepted", "rejected"):
+    if status not in (
+        "pending", "accepted", "rejected"
+    ):
         return False
 
     with conn() as c:
@@ -489,50 +608,3 @@ def set_request_status(rid, status):
         """, (status, rid))
 
         return cur.rowcount > 0
-
-
-def create_chat_invite(a, b):
-    # Bu funksiya hozircha o‘chirilgan.
-    # Voyaga yetmaganlar uchun nazoratsiz shaxsiy chat yo‘q.
-    return False
-
-
-def review_chat_invite(invite_id, accepted):
-    return False
-
-
-def block_user(uid, blocked_uid):
-    if uid == blocked_uid:
-        return False
-
-    with conn() as c:
-        c.execute("""
-            INSERT OR IGNORE INTO blocks(
-                user_id, blocked_id, created_at
-            )
-            VALUES(?,?,?)
-        """, (uid, blocked_uid, now()))
-
-        # Bloklanganda avvalgi layklarni ham bekor qilamiz.
-        c.execute("""
-            DELETE FROM likes
-            WHERE (from_id=? AND to_id=?)
-               OR (from_id=? AND to_id=?)
-        """, (uid, blocked_uid, blocked_uid, uid))
-
-    return True
-
-
-def report_user(uid, reported_uid, reason=""):
-    if uid == reported_uid:
-        return None
-
-    with conn() as c:
-        cur = c.execute("""
-            INSERT INTO reports(
-                from_id, to_id, reason, created_at
-            )
-            VALUES(?,?,?,?)
-        """, (uid, reported_uid, reason[:300], now()))
-
-        return cur.lastrowid
