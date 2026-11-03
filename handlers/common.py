@@ -1,15 +1,17 @@
 
 from aiogram import Router, F
 from aiogram.types import (
-    Message, CallbackQuery, KeyboardButton, ReplyKeyboardMarkup,
-    InlineKeyboardMarkup, InlineKeyboardButton
+    Message, CallbackQuery, KeyboardButton,
+    ReplyKeyboardMarkup, InlineKeyboardMarkup,
+    InlineKeyboardButton
 )
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.context import FSMContext
 
 from config import (
-    ADMIN_ID, PREMIUM_WEEK_DAYS, PREMIUM_MONTH_DAYS,
-    PREMIUM_WEEK_PRICE, PREMIUM_MONTH_PRICE
+    ADMIN_ID,
+    PREMIUM_WEEK_PRICE,
+    PREMIUM_MONTH_PRICE
 )
 import database as db
 
@@ -44,23 +46,71 @@ def menu():
             ],
             [
                 KeyboardButton(text="💗 Menga kim layk bosdi"),
-                KeyboardButton(text="💜 VIP CHAT")
+                KeyboardButton(text="💎 PREMIUM")
             ],
-            [KeyboardButton(text="💎 PREMIUM")]
+            [KeyboardButton(text="🚫 Bloklanganlar")]
         ],
         resize_keyboard=True
     )
 
 
-def adult_verified(uid):
+def profile_buttons(uid):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [
+            InlineKeyboardButton(
+                text="❤️",
+                callback_data=f"like:{uid}"
+            ),
+            InlineKeyboardButton(
+                text="👎🏻",
+                callback_data=f"skip:{uid}"
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="🚫 Bloklash",
+                callback_data=f"block:{uid}"
+            ),
+            InlineKeyboardButton(
+                text="⚠️ Shikoyat",
+                callback_data=f"report:{uid}"
+            )
+        ]
+    ])
+
+
+def user_active(uid):
     u = db.get_user(uid)
-    return bool(u and u["approved"] and u["adult_verified"] and u["is_active"])
+    return bool(u and u["approved"] and u["is_active"])
 
 
-def main_access(m):
-    if not adult_verified(m.from_user.id):
-        return False
-    return True
+def show_profile(p):
+    return (
+        f"<b>{p['name'] or 'Foydalanuvchi'}</b>\n"
+        f"📍 {p['city'] or 'Ko‘rsatilmagan'}\n\n"
+        f"{p['bio'] or 'Bio kiritilmagan'}"
+    )
+
+
+async def send_next_profile(m: Message):
+    if not user_active(m.from_user.id):
+        await m.answer("Avval profilingizni yarating.")
+        return
+
+    p = db.next_profile(m.from_user.id)
+
+    if not p:
+        await m.answer(
+            "Hozircha boshqa mos profil topilmadi. "
+            "Keyinroq yana urinib ko‘ring."
+        )
+        return
+
+    await m.answer_photo(
+        p["photo_id"],
+        caption=show_profile(p),
+        reply_markup=profile_buttons(p["user_id"])
+    )
 
 
 @router.message(F.text == "/start")
@@ -71,12 +121,6 @@ async def start(m: Message, state: FSMContext):
     u = db.get_user(m.from_user.id)
 
     if u and u["approved"]:
-        if not u["adult_verified"]:
-            await m.answer(
-                "🔒 Profilingiz uchun ishonchli 18+ yosh tekshiruvi hali yakunlanmagan."
-            )
-            return
-
         await m.answer(
             "⭐ A_Match ga xush kelibsiz!",
             reply_markup=menu()
@@ -85,8 +129,8 @@ async def start(m: Message, state: FSMContext):
 
     await state.set_state(Reg.age)
     await m.answer(
-        "🔞 A_Match faqat 18+ foydalanuvchilar uchun.\n"
-        "Yoshingizni kiriting. Yoshni yozishning o‘zi tasdiqlash hisoblanmaydi."
+        "⭐ A_Match ga xush kelibsiz!\n\n"
+        "Yoshingizni kiriting (15 yoshdan boshlab)."
     )
 
 
@@ -98,13 +142,8 @@ async def age(m: Message, state: FSMContext):
         await m.answer("Yoshingizni raqam bilan kiriting.")
         return
 
-    if n < 18:
-        await state.clear()
-        await m.answer("Bu xizmat faqat 18 yoshdan kattalar uchun.")
-        return
-
-    if n > 100:
-        await m.answer("Yoshni tekshirib qayta kiriting.")
+    if n < 15 or n > 100:
+        await m.answer("15 dan 100 gacha bo‘lgan yoshni kiriting.")
         return
 
     await state.update_data(age=n)
@@ -126,7 +165,7 @@ async def city(m: Message, state: FSMContext):
 @router.message(Reg.name)
 async def name(m: Message, state: FSMContext):
     if not m.text:
-        await m.answer("Ismingizni matn ko‘rinishida yuboring.")
+        await m.answer("Ismingizni yozing.")
         return
 
     await state.update_data(name=m.text[:40])
@@ -157,15 +196,19 @@ async def gender(m: Message, state: FSMContext):
         ],
         resize_keyboard=True
     )
+
     await m.answer(
-        "O‘zingiz haqingizda qisqacha yozing yoki o‘tkazib yuboring:",
+        "O‘zingiz haqingizda yozing yoki o‘tkazib yuboring:",
         reply_markup=kb
     )
 
 
 @router.message(Reg.bio)
 async def bio(m: Message, state: FSMContext):
-    text = "" if m.text == "⏭ O‘tkazib yuborish" else (m.text or "")[:300]
+    text = (
+        "" if m.text == "⏭ O‘tkazib yuborish"
+        else (m.text or "")[:300]
+    )
 
     await state.update_data(bio=text)
     await state.set_state(Reg.photo)
@@ -174,16 +217,6 @@ async def bio(m: Message, state: FSMContext):
 
 @router.message(Reg.photo, F.photo)
 async def photo(m: Message, state: FSMContext):
-    from face_check import contains_face
-
-    file = await m.bot.get_file(m.photo[-1].file_id)
-    data = await m.bot.download_file(file.file_path)
-    raw = data.read()
-
-    if not contains_face(raw):
-        await m.answer("❌ Rasmda yuz aniqlanmadi. Boshqa rasm yuboring.")
-        return
-
     d = await state.get_data()
 
     db.save_user(
@@ -192,83 +225,64 @@ async def photo(m: Message, state: FSMContext):
         photo_id=m.photo[-1].file_id,
         username=m.from_user.username,
         approved=1,
-        created_at=""
+        created_at=db.now()
     )
 
     await state.clear()
     await m.answer(
-        "✅ Profil ma’lumotlari saqlandi.\n"
-        "🔒 Tanishuv funksiyalari yosh ishonchli tasdiqlangandan keyin ochiladi."
+        "✅ Profil ma’lumotlari saqlandi!\n"
+        "🎉 A_Match dan foydalanishingiz mumkin.",
+        reply_markup=menu()
     )
 
 
 @router.message(Reg.photo)
 async def wrong_photo(m: Message):
-    await m.answer("Iltimos, rasm yuboring.")
+    await m.answer("Iltimos, profil rasmini yuboring.")
 
 
 @router.message(F.text == "🔎 Qidirish")
 async def search(m: Message):
-    if not main_access(m):
-        await m.answer("🔒 Avval profilingiz uchun 18+ tekshiruv yakunlanishi kerak.")
-        return
-
-    u = db.get_user(m.from_user.id)
-    p = db.next_profile(m.from_user.id, u["gender"])
-
-    if not p:
-        await m.answer("Hozircha yangi tasdiqlangan profil topilmadi.")
-        return
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(
-            text="❤️ Layk",
-            callback_data=f"like:{p['user_id']}"
-        ),
-        InlineKeyboardButton(
-            text="👎 O‘tkazish",
-            callback_data=f"skip:{p['user_id']}"
-        )
-    ]])
-
-    caption = (
-        f"<b>{p['name']}</b>, {p['age']} yosh\n"
-        f"📍 {p['city']}\n\n{p['bio'] or 'Bio kiritilmagan'}"
-    )
-
-    await m.answer_photo(
-        p["photo_id"],
-        caption=caption,
-        reply_markup=kb
-    )
+    await send_next_profile(m)
 
 
 @router.callback_query(F.data.startswith("like:"))
 async def like(c: CallbackQuery):
-    if not adult_verified(c.from_user.id):
-        await c.answer("18+ tekshiruv talab qilinadi.", show_alert=True)
+    if not user_active(c.from_user.id):
+        await c.answer("Avval profil yarating.", show_alert=True)
         return
 
     target = int(c.data.split(":")[1])
 
-    if not adult_verified(target):
-        await c.answer("Bu profil hozir mavjud emas.")
+    if target == c.from_user.id:
+        await c.answer("O‘zingizga layk bosolmaysiz.")
+        return
+
+    p = db.get_user(target)
+
+    if not p or not p["approved"] or not p["is_active"]:
+        await c.answer("Bu profil mavjud emas.")
+        return
+
+    # Voyaga yetmaganlar va kattalar o‘rtasida
+    # layk aloqasi yaratilmaydi.
+    me = db.get_user(c.from_user.id)
+
+    if (me["age"] < 18) != (p["age"] < 18):
+        await c.answer(
+            "Bu profil sizning yosh guruhingizga mos emas.",
+            show_alert=True
+        )
         return
 
     mutual = db.add_like(c.from_user.id, target)
 
     if mutual:
+        await c.answer("O‘zaro layk! ❤️")
         await c.message.answer(
-            "💞 Sizlarda o‘zaro Match!\n"
-            "Endi suhbat boshlash uchun taklif yuborishingiz mumkin."
+            "❤️ Sizlarda o‘zaro qiziqish bor! "
+            "Shaxsiy chat avtomatik ochilmaydi."
         )
-        try:
-            await c.bot.send_message(
-                target,
-                "💞 Sizlarda o‘zaro Match bor! Suhbat boshlashingiz mumkin."
-            )
-        except Exception:
-            pass
     else:
         await c.answer("Layk yuborildi ❤️")
 
@@ -278,15 +292,21 @@ async def like(c: CallbackQuery):
 @router.callback_query(F.data.startswith("skip:"))
 async def skip(c: CallbackQuery):
     target = int(c.data.split(":")[1])
+
+    if target == c.from_user.id:
+        await c.answer("Bu amalni bajarib bo‘lmaydi.")
+        return
+
     db.add_skip(c.from_user.id, target)
-    await c.answer("O‘tkazib yuborildi")
+
+    await c.answer("Keyingi profil 👎🏻")
     await c.message.delete()
 
 
 @router.message(F.text == "💗 Menga kim layk bosdi")
 async def likes(m: Message):
-    if not main_access(m):
-        await m.answer("🔒 Avval 18+ tekshiruv yakunlanishi kerak.")
+    if not user_active(m.from_user.id):
+        await m.answer("Avval profilingizni yarating.")
         return
 
     rows = db.received_likes(m.from_user.id)
@@ -297,210 +317,109 @@ async def likes(m: Message):
 
     for p in rows[:20]:
         await m.answer(
-            f"❤️ {p['name']}, {p['age']} yosh — {p['city']}"
+            f"❤️ {p['name']}\n"
+            f"📍 {p['city'] or 'Ko‘rsatilmagan'}"
         )
 
 
-@router.message(F.text == "💎 PREMIUM")
-async def premium(m: Message):
-    if not main_access(m):
-        await m.answer("🔒 Avval 18+ tekshiruv yakunlanishi kerak.")
+@router.callback_query(F.data.startswith("block:"))
+async def block(c: CallbackQuery):
+    target = int(c.data.split(":")[1])
+
+    if target == c.from_user.id:
+        await c.answer("O‘zingizni bloklay olmaysiz.")
         return
 
-    await m.answer(
-        "💎 <b>PRO OBUNA</b>\n\n"
-        f"✨ 1 hafta — {PREMIUM_WEEK_PRICE:,} so‘m\n"
-        f"✨ 1 oy — {PREMIUM_MONTH_PRICE:,} so‘m\n\n"
-        "Pro imkoniyatlari:\n"
-        "• 5 tagacha qo‘shimcha chat taklifi\n"
-        "• Profilingizga qo‘shimcha imkoniyatlar\n\n"
-        "To‘lov admin tomonidan tekshiriladi.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(
-                text="1 hafta",
-                callback_data="buy:7"
-            )],
-            [InlineKeyboardButton(
-                text="1 oy",
-                callback_data="buy:30"
-            )]
-        ])
-    )
+    db.block_user(c.from_user.id, target)
+
+    await c.answer("Foydalanuvchi bloklandi.", show_alert=True)
+
+    try:
+        await c.message.delete()
+    except Exception:
+        pass
 
 
-@router.callback_query(F.data.startswith("buy:"))
-async def buy(c: CallbackQuery, state: FSMContext):
-    if not adult_verified(c.from_user.id):
-        await c.answer("18+ tekshiruv talab qilinadi.", show_alert=True)
+@router.callback_query(F.data.startswith("report:"))
+async def report(c: CallbackQuery):
+    target = int(c.data.split(":")[1])
+
+    if target == c.from_user.id:
+        await c.answer("O‘zingiz haqida shikoyat yuborib bo‘lmaydi.")
         return
 
-    days = int(c.data.split(":")[1])
-
-    if days == 7:
-        amount = PREMIUM_WEEK_PRICE
-    elif days == 30:
-        amount = PREMIUM_MONTH_PRICE
-    else:
-        await c.answer("Noto‘g‘ri tarif.", show_alert=True)
-        return
-
-    await state.update_data(plan_days=days, amount=amount)
-    await state.set_state(Payment.receipt)
-
-    await c.message.answer(
-        f"💎 Tanlangan tarif: {days} kun\n"
-        f"To‘lov miqdori: {amount:,} so‘m\n\n"
-        "To‘lovni faqat bot egasi ko‘rsatgan rasmiy to‘lov usuli orqali qiling. "
-        "So‘ng chek rasmini yuboring.\n"
-        "Chek admin tomonidan mustaqil tekshiriladi."
-    )
-    await c.answer()
-
-
-@router.message(Payment.receipt, F.photo)
-async def payment_receipt(m: Message, state: FSMContext):
-    d = await state.get_data()
-
-    payment_id = db.create_payment(
-        m.from_user.id,
-        d["plan_days"],
-        d["amount"],
-        m.photo[-1].file_id
+    report_id = db.report_user(
+        c.from_user.id,
+        target,
+        "Profil bo‘yicha shikoyat"
     )
 
-    await state.clear()
-
-    await m.answer(
-        "🧾 Chekingiz admin tekshiruviga yuborildi. "
-        "Tekshiruv tugagach sizga xabar beriladi."
-    )
-
-    if ADMIN_ID:
-        kb = InlineKeyboardMarkup(inline_keyboard=[[
-            InlineKeyboardButton(
-                text="✅ Tasdiqlash",
-                callback_data=f"payok:{payment_id}"
-            ),
-            InlineKeyboardButton(
-                text="❌ Rad etish",
-                callback_data=f"payno:{payment_id}"
-            )
-        ]])
-
+    if report_id and ADMIN_ID:
         try:
-            await m.bot.send_photo(
+            await c.bot.send_message(
                 ADMIN_ID,
-                m.photo[-1].file_id,
-                caption=(
-                    f"💳 Yangi to‘lov so‘rovi\n"
-                    f"ID: {payment_id}\n"
-                    f"Foydalanuvchi: {m.from_user.id}\n"
-                    f"Tarif: {d['plan_days']} kun\n"
-                    f"Summa: {d['amount']:,} so‘m\n\n"
-                    "Tasdiqlashdan oldin bank ilovasida to‘lovni tekshiring."
-                ),
-                reply_markup=kb
+                f"⚠️ Yangi shikoyat\n"
+                f"ID: {report_id}\n"
+                f"Yuboruvchi: {c.from_user.id}\n"
+                f"Profil: {target}"
             )
         except Exception:
             pass
 
-
-@router.message(Payment.receipt)
-async def wrong_receipt(m: Message):
-    await m.answer("Iltimos, to‘lov chekini rasm ko‘rinishida yuboring.")
-
-
-@router.callback_query(F.data.startswith("payok:"))
-async def payment_approve(c: CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        await c.answer("Bu amal faqat admin uchun.", show_alert=True)
-        return
-
-    payment_id = int(c.data.split(":")[1])
-    row = db.get_payment(payment_id)
-
-    if not row or row["status"] != "pending":
-        await c.answer("Bu to‘lov allaqachon ko‘rib chiqilgan.")
-        return
-
-    if not db.review_payment(payment_id, c.from_user.id, True):
-        await c.answer("To‘lovni tasdiqlab bo‘lmadi.")
-        return
-
-    await c.bot.send_message(
-        row["user_id"],
-        "✅ To‘lovingiz admin tomonidan tasdiqlandi. Pro obunangiz faollashtirildi!"
+    await c.answer(
+        "Shikoyatingiz yuborildi. Rahmat!",
+        show_alert=True
     )
-
-    await c.message.edit_caption(
-        caption=f"✅ To‘lov #{payment_id} admin tomonidan tasdiqlandi."
-    )
-    await c.answer("Pro faollashtirildi.")
-
-
-@router.callback_query(F.data.startswith("payno:"))
-async def payment_reject(c: CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        await c.answer("Bu amal faqat admin uchun.", show_alert=True)
-        return
-
-    payment_id = int(c.data.split(":")[1])
-    row = db.get_payment(payment_id)
-
-    if not row or row["status"] != "pending":
-        await c.answer("Bu to‘lov allaqachon ko‘rib chiqilgan.")
-        return
-
-    if not db.review_payment(payment_id, c.from_user.id, False):
-        await c.answer("So‘rovni rad etib bo‘lmadi.")
-        return
-
-    await c.bot.send_message(
-        row["user_id"],
-        "❌ To‘lov tasdiqlanmadi. Iltimos, admin bilan bog‘laning."
-    )
-
-    await c.message.edit_caption(
-        caption=f"❌ To‘lov #{payment_id} rad etildi."
-    )
-    await c.answer("To‘lov rad etildi.")
 
 
 @router.message(F.text == "⚙️ Anketa sozlamalari")
 async def settings(m: Message):
-    if not main_access(m):
-        await m.answer("🔒 Avval 18+ tekshiruv yakunlanishi kerak.")
+    if not user_active(m.from_user.id):
+        await m.answer("Avval profilingizni yarating.")
         return
 
     kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="Ismni o‘zgartirish", callback_data="edit:name")],
-        [InlineKeyboardButton(text="Bio o‘zgartirish", callback_data="edit:bio")],
-        [InlineKeyboardButton(text="Rasmni o‘zgartirish", callback_data="edit:photo")],
-        [InlineKeyboardButton(text="Profilni o‘chirish", callback_data="profile:delete")]
+        [InlineKeyboardButton(
+            text="Ismni o‘zgartirish",
+            callback_data="edit:name"
+        )],
+        [InlineKeyboardButton(
+            text="Bio o‘zgartirish",
+            callback_data="edit:bio"
+        )],
+        [InlineKeyboardButton(
+            text="Rasmni o‘zgartirish",
+            callback_data="edit:photo"
+        )]
     ])
 
-    await m.answer("⚙️ Qaysi ma’lumotni o‘zgartirmoqchisiz?", reply_markup=kb)
+    await m.answer(
+        "⚙️ Qaysi ma’lumotni o‘zgartirmoqchisiz?",
+        reply_markup=kb
+    )
 
 
 @router.callback_query(F.data.startswith("edit:"))
 async def edit_start(c: CallbackQuery, state: FSMContext):
-    if not adult_verified(c.from_user.id):
-        await c.answer("18+ tekshiruv talab qilinadi.", show_alert=True)
-        return
-
     field = c.data.split(":")[1]
+
+    if not user_active(c.from_user.id):
+        await c.answer("Avval profil yarating.", show_alert=True)
+        return
 
     if field == "name":
         await state.set_state(EditProfile.name)
         await c.message.answer("Yangi ismingizni kiriting:")
+
     elif field == "bio":
         await state.set_state(EditProfile.bio)
         await c.message.answer(
-            "Yangi bio yozing yoki o‘zgartirmaslik uchun /cancel yuboring:"
+            "Yangi bio yozing yoki /cancel yuboring:"
         )
+
     elif field == "photo":
         await state.set_state(EditProfile.photo)
-        await c.message.answer("Yangi profilingiz rasmini yuboring.")
+        await c.message.answer("Yangi rasm yuboring.")
 
     await c.answer()
 
@@ -513,14 +432,14 @@ async def edit_name(m: Message, state: FSMContext):
 
     db.save_user(m.from_user.id, name=m.text[:40])
     await state.clear()
-    await m.answer("✅ Ismingiz yangilandi.", reply_markup=menu())
+    await m.answer("✅ Ism yangilandi.", reply_markup=menu())
 
 
 @router.message(EditProfile.bio)
 async def edit_bio(m: Message, state: FSMContext):
     if m.text == "/cancel":
         await state.clear()
-        await m.answer("O‘zgarish bekor qilindi.", reply_markup=menu())
+        await m.answer("Bekor qilindi.", reply_markup=menu())
         return
 
     db.save_user(m.from_user.id, bio=(m.text or "")[:300])
@@ -530,16 +449,11 @@ async def edit_bio(m: Message, state: FSMContext):
 
 @router.message(EditProfile.photo, F.photo)
 async def edit_photo(m: Message, state: FSMContext):
-    from face_check import contains_face
+    db.save_user(
+        m.from_user.id,
+        photo_id=m.photo[-1].file_id
+    )
 
-    file = await m.bot.get_file(m.photo[-1].file_id)
-    data = await m.bot.download_file(file.file_path)
-
-    if not contains_face(data.read()):
-        await m.answer("❌ Rasmda yuz aniqlanmadi. Boshqa rasm yuboring.")
-        return
-
-    db.save_user(m.from_user.id, photo_id=m.photo[-1].file_id)
     await state.clear()
     await m.answer("✅ Rasm yangilandi.", reply_markup=menu())
 
@@ -549,28 +463,14 @@ async def edit_photo_wrong(m: Message):
     await m.answer("Iltimos, rasm yuboring.")
 
 
-@router.callback_query(F.data == "profile:delete")
-async def delete_profile(c: CallbackQuery):
-    if c.from_user.id != ADMIN_ID:
-        await c.answer(
-            "Profilni o‘chirish hozircha admin orqali amalga oshiriladi.",
-            show_alert=True
-        )
-        return
-
-    await c.answer("Admin tasdig‘i talab qilinadi.", show_alert=True)
-
-
-@router.message(F.text == "💜 VIP CHAT")
-async def vip(m: Message):
-    if not main_access(m):
-        await m.answer("🔒 Avval 18+ tekshiruv yakunlanishi kerak.")
-        return
-
+@router.message(F.text == "💎 PREMIUM")
+async def premium(m: Message):
     await m.answer(
-        "💜 VIP CHAT\n"
-        "Qo‘shimcha chat takliflari faqat Pro foydalanuvchilarga beriladi. "
-        "Qabul qiluvchi rozilik bergandan keyingina suhbat ochiladi."
+        "💎 PREMIUM\n\n"
+        f"1 hafta — {PREMIUM_WEEK_PRICE:,} so‘m\n"
+        f"1 oy — {PREMIUM_MONTH_PRICE:,} so‘m\n\n"
+        "To‘lov va obuna imkoniyatlari hozircha "
+        "faqat admin orqali boshqariladi."
     )
 
 
@@ -580,11 +480,14 @@ async def stats(m: Message):
         return
 
     await m.answer(
-        f"👥 Tasdiqlangan 18+ profillar: {db.count_users()}"
+        f"👥 Jami profillar: {db.count_users()}"
     )
 
 
 @router.message(F.text == "/cancel")
 async def cancel(m: Message, state: FSMContext):
     await state.clear()
-    await m.answer("Bekor qilindi.", reply_markup=menu())
+    await m.answer(
+        "Bekor qilindi.",
+        reply_markup=menu()
+    )
